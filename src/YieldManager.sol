@@ -10,6 +10,8 @@ import {ITokenMessengerV2} from "./interfaces/ITokenMessengerV2.sol";
 import {IMessageTransmitterV2} from "./interfaces/IMessageTransmitterV2.sol";
 import {DataTypes} from "./librairies/DataTypes.sol";
 
+import {console} from "forge-std/console.sol";
+
 contract YieldManager is AccessControl {
 
     using SafeCast for uint256;
@@ -47,6 +49,8 @@ contract YieldManager is AccessControl {
         uint256 amount
     );
 
+    event log_bytes(bytes data);
+
     constructor(
         address _tokenMessenger,
         address _messageTransmitter,
@@ -70,8 +74,10 @@ contract YieldManager is AccessControl {
     function processDeposit(
         bytes memory _message,
         bytes memory _attestation
-    ) external onlyRole(OPERATOR_ROLE) {
+    ) external onlyRole(OPERATOR_ROLE) returns(bool) {
         uint256 usdcBalanceBefore = IERC20(USDC).balanceOf(address(this));
+
+        console.log("usdcBalanceBefore: %s", usdcBalanceBefore);
 
         bool success = MESSAGE_TRANSMITTER.receiveMessage(
             _message,
@@ -80,24 +86,29 @@ contract YieldManager is AccessControl {
 
         require(success, "YieldManager: Message processing failed");
 
-        (uint8 pool, address from, uint256 amount) = abi.decode(
-            _message,
-            (uint8, address, uint256)
-        );
+        emit log_bytes(_message);
 
+        (uint8 pool, address from, uint256 amount) = extractParams(_message);
+
+        console.log("usdc balance after receiveMessage: %s", IERC20(USDC).balanceOf(address(this)));
+
+        /// remove fees
         require(amount == IERC20(USDC).balanceOf(address(this)) - usdcBalanceBefore, "YieldManager: Amount mismatch");
 
         uint256 amountAaveUsdc = 0;
 
+        bytes32 positionId = keccak256(abi.encodePacked(pool, from, block.timestamp));
+
         if (pool == 0) {
             amountAaveUsdc = _depositAave(amount);
-        } else {
+        } 
+        else if (pool == 1) {
+            emit DepositProcessed(positionId, pool, from, amount);
+            return true; 
+        }
+        else {
             revert("YieldManager: Invalid pool");
         }
-
-        bytes32 positionId = keccak256(
-            abi.encodePacked(pool, from, block.timestamp)
-        );
 
         if (positions[from].user != address(0)) {
             positions[from].amountUsdc += amount;
@@ -111,6 +122,8 @@ contract YieldManager is AccessControl {
         }
 
         emit DepositProcessed(positionId, pool, from, amount);
+
+        return true;
     }
 
     function processRebalancing(
@@ -185,5 +198,33 @@ contract YieldManager is AccessControl {
             )
         }
         return res;
+    }
+
+    
+        function extractParams(bytes memory data) public pure returns (uint8 pool, address from, uint256 amount) {
+        // Vérifier que les données ont au moins la taille minimale requise
+        require(data.length >= 96, "Data too short");
+        
+        // Extraire les paramètres en utilisant abi.decode
+        // On skip les premiers paramètres et on va directement aux 3 derniers
+        // Basé sur votre exemple, les derniers paramètres semblent être à la fin
+        
+        // Méthode 1: Extraction manuelle avec assembly pour plus de contrôle
+        assembly {
+            // Les données commencent à offset 32 (longueur du bytes)
+            let dataPtr := add(data, 32)
+            
+            // Aller à la fin des données pour extraire les 3 derniers paramètres (96 bytes)
+            let endPtr := add(dataPtr, sub(mload(data), 96))
+            
+            // Extraire uint8 pool (dernier uint8, stocké sur 32 bytes)
+            pool := byte(31, mload(add(endPtr, 0)))
+            
+            // Extraire address from (20 bytes, stocké sur 32 bytes)
+            from := mload(add(endPtr, 32))
+            
+            // Extraire uint256 amount
+            amount := mload(add(endPtr, 64))
+        }
     }
 }
