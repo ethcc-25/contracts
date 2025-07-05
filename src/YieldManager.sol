@@ -26,13 +26,12 @@ contract YieldManager is AccessControl, ReentrancyGuard {
         address user;
         uint256 amountUsdc;
         uint256 shares; // ERC4626 shares
+        address vault;
     }
 
     ITokenMessengerV2     public immutable TOKEN_MESSENGER;
     IMessageTransmitterV2 public immutable MESSAGE_TRANSMITTER;
     IERC20                public immutable USDC;
-    IERC20                public immutable AAVE_USDC;
-    IAavePool             public immutable AAVE_POOL;
     ISignatureTransfer    public immutable PERMIT_2 = ISignatureTransfer(0x000000000022D473030F116dDEE9F6B43aC78BA3);
 
     uint8   public WORLD_DOMAIN = 14;
@@ -73,16 +72,12 @@ contract YieldManager is AccessControl, ReentrancyGuard {
     constructor(
         address _tokenMessenger,
         address _messageTransmitter,
-        address _aavePool,
         address _usdc,
-        address _aaveUsdc,
         bool    _isWorld
     ) {
         TOKEN_MESSENGER     = ITokenMessengerV2(_tokenMessenger);
         MESSAGE_TRANSMITTER = IMessageTransmitterV2(_messageTransmitter);
-        AAVE_POOL           = IAavePool(_aavePool);
         USDC                = IERC20(_usdc);
-        AAVE_USDC           = IERC20(_aaveUsdc);
         IS_WORLD            = _isWorld;
 
         _grantRole(OPERATOR_ROLE, msg.sender);
@@ -140,7 +135,6 @@ contract YieldManager is AccessControl, ReentrancyGuard {
             msg.sender,
             transferDetails.requestedAmount
         );
-        
     }
 
     // =============================================================
@@ -151,75 +145,47 @@ contract YieldManager is AccessControl, ReentrancyGuard {
         bytes memory _message,
         bytes memory _attestation
     ) external onlyRole(OPERATOR_ROLE) {
-        bool success = MESSAGE_TRANSMITTER.receiveMessage(
-            _message,
-            _attestation
-        );
 
+        bool success = MESSAGE_TRANSMITTER.receiveMessage(_message, _attestation);
         require(success, "YieldManager: Message processing failed");
 
-        (
-            uint8   pool,
-            address from,
-            uint256 amount,
-            address morphoVault
-        ) = extractParams(_message);
+        (uint8 pool, address from, uint256 amount, address vault) = extractParams(_message);
 
-        // 0.01% CCTP fee
         uint256 amountWithFee = (amount * (1e6 - CCTP_FEE)) / 1e6;
         uint256 shares = 0;
 
-        bytes32 positionId = keccak256(
-            abi.encodePacked(pool, from, block.timestamp)
-        );
+        bytes32 positionId = keccak256(abi.encodePacked(pool, from, block.timestamp));
 
-        if (pool == 1) {
-            shares = depositAave(amountWithFee);
-        }
-        else if (pool == 2){
-            require(morphoVault != address(0), "YieldManager: Invalid morpho vault");
-            shares = IMorphoVault(morphoVault).deposit(amountWithFee, from);
-        }
-         else {
-            revert("YieldManager: Invalid pool");
-        }
+        if      (pool == 1) shares = depositAave(amountWithFee, vault);
+        else if (pool == 2) shares = depositMorpho(amountWithFee, vault);
+        else revert("YieldManager: Invalid pool");
 
-        if (positions[from].user != address(0)) {
-            positions[from].amountUsdc += amountWithFee;
-            positions[from].shares += shares;
-        } else {
-            Position storage newPosition = positions[from];
-            newPosition.pool = pool;
-            newPosition.positionId = positionId;
-            newPosition.user = from;
-            newPosition.amountUsdc = amountWithFee;
-            newPosition.shares = shares;
-        }
+        Position storage position = positions[from];
+        position.pool = pool;
+        position.positionId = positionId;
+        position.user = from;
+        position.amountUsdc += amountWithFee;
+        position.shares += shares;
+        position.vault = vault;
 
         emit DepositProcessed(positionId, pool, from, amount, shares);
     }
 
-    function processRebalancing(
-        address user,
-        uint8 destChainId,
-        bytes memory message
-    ) external onlyRole(OPERATOR_ROLE) {}
 
+    /**
+     * @notice Processes a withdrawal from CCTP to user on WORLD
+     */
     function processWithdraw(
         bytes memory _message,
         bytes memory _attestation
     ) external onlyRole(OPERATOR_ROLE) {
-        // Used on World to process the withdrawal message
-        // Take fees now
-
-        bool success = MESSAGE_TRANSMITTER.receiveMessage(
-            _message,
-            _attestation
-        );
-
+        bool success = MESSAGE_TRANSMITTER.receiveMessage(_message, _attestation);
         require(success, "YieldManager: Message processing failed");
     }
 
+    /**
+     * @notice Initializes the withdrawal process for a user from a remote chain to WORLD
+     */
     function initWithdraw(address user) external onlyRole(OPERATOR_ROLE) {
         Position storage position = positions[user];
         require(
@@ -231,9 +197,14 @@ contract YieldManager is AccessControl, ReentrancyGuard {
 
         if (position.pool == 1) {
             withdrawnAmount = withdrawAave(position);
+            bridgeTo(withdrawnAmount, WORLD_DOMAIN, position);
         }
         else if (position.pool == 2) {
-
+            withdrawnAmount = withdrawMorpho(position);
+            bridgeTo(withdrawnAmount, WORLD_DOMAIN, position);
+        }
+        else {
+            revert("YieldManager: Invalid pool");
         } 
 
         emit WithdrawProcessed(
@@ -243,7 +214,6 @@ contract YieldManager is AccessControl, ReentrancyGuard {
             withdrawnAmount
         );
 
-        // Reset the position
         delete positions[user];
     }
 
@@ -254,82 +224,23 @@ contract YieldManager is AccessControl, ReentrancyGuard {
     function getWithdrawableUSDC(
         Position memory position
     ) public view returns (uint256) {
-        DataTypes.ReserveDataLegacy memory data = IAavePool(AAVE_POOL)
+        DataTypes.ReserveDataLegacy memory data = IAavePool(position.vault)
             .getReserveData(address(USDC));
         return (position.shares * uint256(data.liquidityIndex)) / 1e27;
     }
 
     // =============================================================
-    //                          INTERNALS
+    //                          DEPOSITS
     // =============================================================
 
-    function depositAave(uint256 amount) internal returns (uint256) {
-        // Balance scaled AVANT le dépôt
-        DataTypes.ReserveDataLegacy memory dataBefore = AAVE_POOL.getReserveData(address(USDC));
-        uint256 scaledBalanceBefore = (IERC20(AAVE_USDC).balanceOf(address(this)) * 1e27) / dataBefore.liquidityIndex;
+    function depositAave(uint256 amount, address vault) internal returns (uint256) {
+
+        DataTypes.ReserveDataLegacy memory dataBefore = IAavePool(vault).getReserveData(address(USDC));
+        uint256 scaledBalanceBefore = (IERC20(dataBefore.aTokenAddress).balanceOf(address(this)) * 1e27) / dataBefore.liquidityIndex;
         
-        // Effectuer le dépôt
-        IERC20(USDC).approve(address(AAVE_POOL), amount);
-        AAVE_POOL.supply(encodeSupplyParams(address(USDC), amount, 0));
-        
-        // Balance scaled APRÈS le dépôt (avec le nouvel index)
-        DataTypes.ReserveDataLegacy memory dataAfter = AAVE_POOL.getReserveData(address(USDC));
-        uint256 scaledBalanceAfter = (IERC20(AAVE_USDC).balanceOf(address(this)) * 1e27) / dataAfter.liquidityIndex;
-        
-        return scaledBalanceAfter - scaledBalanceBefore;
-    }
+        IERC20(USDC).approve(address(vault), amount);
 
-    function withdrawAave(
-        Position memory position
-    ) internal returns (uint256) {
-
-        uint256 withdrawableAmount = getWithdrawableUSDC(position);
-
-        require(withdrawableAmount > 0, "YieldManager: No withdrawable amount");
-
-        uint256 withdrawnAmount = AAVE_POOL.withdraw(
-            address(USDC),
-            withdrawableAmount,
-            address(this)
-        );
-
-        require(
-            withdrawnAmount == withdrawableAmount,
-            "YieldManager: Withdrawn amount mismatch"
-        );
-
-        uint256 fee = (withdrawnAmount * CCTP_FEE) / 1e6;
-
-        IERC20(USDC).approve(
-            address(TOKEN_MESSENGER),
-            withdrawnAmount
-        );
-
-        TOKEN_MESSENGER.depositForBurn(
-            withdrawnAmount,
-            WORLD_DOMAIN,
-            bytes32(uint256(uint160(position.user))),
-            address(USDC),
-            bytes32(0),
-            fee,
-            MIN_FINALITY_THRESHOLD
-        );
-
-        return withdrawnAmount;
-    }
-
-    // =============================================================
-    //                          UTILS
-    // =============================================================
-
-    function encodeSupplyParams(
-        address asset,
-        uint256 amount,
-        uint16 referralCode
-    ) public view returns (bytes32) {
-        DataTypes.ReserveDataLegacy memory data = AAVE_POOL.getReserveData(
-            asset
-        );
+        DataTypes.ReserveDataLegacy memory data = IAavePool(vault).getReserveData(address(USDC));
 
         uint16 assetId = data.id;
         uint128 shortenedAmount = amount.toUint128();
@@ -338,11 +249,90 @@ contract YieldManager is AccessControl, ReentrancyGuard {
         assembly {
             res := add(
                 assetId,
-                add(shl(16, shortenedAmount), shl(144, referralCode))
+                add(shl(16, shortenedAmount), shl(144, 0))
             )
         }
-        return res;
+
+        IAavePool(vault).supply(res);
+        
+        DataTypes.ReserveDataLegacy memory dataAfter = IAavePool(vault).getReserveData(address(USDC));
+        uint256 scaledBalanceAfter = (IERC20(dataBefore.aTokenAddress).balanceOf(address(this)) * 1e27) / dataAfter.liquidityIndex;
+        
+        return scaledBalanceAfter - scaledBalanceBefore;
     }
+
+
+    function depositMorpho(uint256 amount, address vault) internal returns (uint256) {
+
+        IERC20(USDC).approve(vault, amount);
+        uint256 shares = IMorphoVault(vault).deposit(amount, address(this));
+
+        return shares;
+    }
+
+    // =============================================================
+    //                          WITHDRAWALS
+    // =============================================================
+
+    function withdrawAave(Position memory position) internal returns (uint256) {
+
+        uint256 withdrawableAmount = getWithdrawableUSDC(position);
+        require(withdrawableAmount > 0, "YieldManager: No withdrawable amount");
+
+        uint256 withdrawnAmount = IAavePool(position.vault).withdraw(
+            address(USDC),
+            withdrawableAmount,
+            address(this)
+        );
+
+        require(withdrawnAmount == withdrawableAmount, "YieldManager: Withdrawn amount mismatch");
+
+        return withdrawnAmount;
+    }
+
+    function withdrawMorpho(Position memory position) internal returns (uint256) {
+
+        uint256 withdrawnAmount = IMorphoVault(position.vault).redeem(
+            position.shares,
+            address(this),
+            position.user
+        );
+
+        require(
+            withdrawnAmount == position.amountUsdc,
+            "YieldManager: Withdrawn amount mismatch"
+        );
+
+        return withdrawnAmount;
+    }
+
+    function bridgeTo(
+        uint256 amount,
+        uint32 destDomain,
+        Position memory position
+    ) internal {
+        uint256 fee = (amount * CCTP_FEE) / 1e6;
+
+        IERC20(USDC).approve(
+            address(TOKEN_MESSENGER),
+            amount
+        );
+
+        TOKEN_MESSENGER.depositForBurn(
+            amount,
+            destDomain,
+            bytes32(uint256(uint160(position.user))),
+            address(USDC),
+            bytes32(0),
+            fee,
+            MIN_FINALITY_THRESHOLD
+        );
+    }
+
+    // =============================================================
+    //                          UTILS
+    // =============================================================
+
 
     function extractParams(
         bytes memory data
@@ -362,14 +352,6 @@ contract YieldManager is AccessControl, ReentrancyGuard {
             amount := mload(add(endPtr, 64)) // uint256
             vault := mload(add(endPtr, 96)) // address 
         }
-    }
-
-    function emergencyWithdraw(
-        address token,
-        address to,
-        uint256 amount
-    ) external onlyRole(OPERATOR_ROLE) {
-        IERC20(token).transfer(to, amount);
     }
 }
 
