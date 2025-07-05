@@ -21,11 +21,11 @@ contract YieldManager is AccessControl, ReentrancyGuard {
     using SafeCast for uint256;
 
     struct Position {
-        uint8 pool; // 1 Aave - 2 Morpho - 3 Fluid
+        uint8   pool;         // 1 Aave - 2 Morpho - 3 Fluid
         bytes32 positionId; // unique identifier for the position
         address user;
         uint256 amountUsdc;
-        uint256 shares; // ERC4626 shares
+        uint256 shares;     // ERC4626 shares
         address vault;
     }
 
@@ -63,10 +63,6 @@ contract YieldManager is AccessControl, ReentrancyGuard {
         uint8 pool,
         address indexed user,
         uint256 amount
-    );
-
-    event YES(
-        bool isWorld
     );
 
     constructor(
@@ -170,7 +166,6 @@ contract YieldManager is AccessControl, ReentrancyGuard {
 
         emit DepositProcessed(positionId, pool, from, amount, shares);
     }
-
 
     /**
      * @notice Processes a withdrawal from CCTP to user on WORLD
@@ -285,8 +280,6 @@ contract YieldManager is AccessControl, ReentrancyGuard {
             address(this)
         );
 
-        require(withdrawnAmount == withdrawableAmount, "YieldManager: Withdrawn amount mismatch");
-
         return withdrawnAmount;
     }
 
@@ -295,12 +288,7 @@ contract YieldManager is AccessControl, ReentrancyGuard {
         uint256 withdrawnAmount = IMorphoVault(position.vault).redeem(
             position.shares,
             address(this),
-            position.user
-        );
-
-        require(
-            withdrawnAmount == position.amountUsdc,
-            "YieldManager: Withdrawn amount mismatch"
+            address(this)
         );
 
         return withdrawnAmount;

@@ -13,16 +13,14 @@ contract Deploy is Script {
 
     function run() external {
 
-        uint256 pkey = vm.envUint("PKEY");
+        uint256 pkey = vm.envUint("OPERATOR_PKEY");
         operator = vm.addr(pkey);
         vm.startBroadcast(pkey);
-
+        // arb
         manager = new YieldManager(
             0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d,
             0x81D40F21F12A8F0E3252Bccb954D722d4c464B64,
-            0x794a61358D6845594F94dc1DB02A252b5b4814aD,
             0xaf88d065e77c8cC2239327C5EDb3A432268e5831,
-            0x724dc807b04555b71ed48a6896b6F41593b8C637,
             true 
         );
 
