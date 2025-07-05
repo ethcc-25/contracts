@@ -1,19 +1,23 @@
+
+
+
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IERC20Permit} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Permit.sol";
 import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
 import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
+import {ISignatureTransfer} from "./interfaces/ISignatureTransfer.sol";
 import {IMorphoVault} from "./interfaces/IMorphoVault.sol";
 import {IAavePool} from "./interfaces/IAavePool.sol";
 import {ITokenMessengerV2} from "./interfaces/ITokenMessengerV2.sol";
 import {IMessageTransmitterV2} from "./interfaces/IMessageTransmitterV2.sol";
 import {DataTypes} from "./librairies/DataTypes.sol";
 
-import {console} from "forge-std/console.sol";
-
-contract YieldManager is AccessControl {
+contract YieldManager is AccessControl, ReentrancyGuard {
     using SafeCast for uint256;
 
     struct Position {
@@ -24,20 +28,28 @@ contract YieldManager is AccessControl {
         uint256 shares; // ERC4626 shares
     }
 
-    ITokenMessengerV2 public immutable TOKEN_MESSENGER;
+    ITokenMessengerV2     public immutable TOKEN_MESSENGER;
     IMessageTransmitterV2 public immutable MESSAGE_TRANSMITTER;
-    IERC20 public immutable USDC;
-    IERC20 public immutable AAVE_USDC;
-    IAavePool public immutable AAVE_POOL;
+    IERC20                public immutable USDC;
+    IERC20                public immutable AAVE_USDC;
+    IAavePool             public immutable AAVE_POOL;
+    ISignatureTransfer    public immutable PERMIT_2 = ISignatureTransfer(0x000000000022D473030F116dDEE9F6B43aC78BA3);
 
-    uint8 public WORLD_DOMAIN = 14;
+    uint8   public WORLD_DOMAIN = 14;
+    bool    public IS_WORLD = false;
     uint256 public CCTP_FEE = 100; // 0.01% 
-    uint32 public MIN_FINALITY_THRESHOLD = 1000;
+    uint32  public MIN_FINALITY_THRESHOLD = 1000;
 
     address public operator;
     bytes32 public constant OPERATOR_ROLE = keccak256("OPERATOR_ROLE");
 
     mapping(address => Position) public positions;
+
+    event DepositInitiated(
+        uint8 indexed pool,
+        address indexed user,
+        uint256 amount
+    );
 
     event DepositProcessed(
         bytes32 indexed positionId,
@@ -54,20 +66,81 @@ contract YieldManager is AccessControl {
         uint256 amount
     );
 
+    event YES(
+        bool isWorld
+    );
+
     constructor(
         address _tokenMessenger,
         address _messageTransmitter,
         address _aavePool,
         address _usdc,
-        address _aaveUsdc
+        address _aaveUsdc,
+        bool    _isWorld
     ) {
-        TOKEN_MESSENGER = ITokenMessengerV2(_tokenMessenger);
+        TOKEN_MESSENGER     = ITokenMessengerV2(_tokenMessenger);
         MESSAGE_TRANSMITTER = IMessageTransmitterV2(_messageTransmitter);
-        AAVE_POOL = IAavePool(_aavePool);
-        USDC = IERC20(_usdc);
-        AAVE_USDC = IERC20(_aaveUsdc);
+        AAVE_POOL           = IAavePool(_aavePool);
+        USDC                = IERC20(_usdc);
+        AAVE_USDC           = IERC20(_aaveUsdc);
+        IS_WORLD            = _isWorld;
 
         _grantRole(OPERATOR_ROLE, msg.sender);
+    }
+
+    // =============================================================
+    //                     USERS FUNCTIONS
+    // =============================================================
+
+    function signatureTransfer(
+        uint8   pool,
+        uint32  chaindId,
+        address yieldManager,
+        address vault,
+        ISignatureTransfer.PermitTransferFrom memory permitTransferFrom,
+        ISignatureTransfer.SignatureTransferDetails calldata transferDetails,
+        bytes calldata signature
+    ) public {
+        require(IS_WORLD, "YieldManager: Not on World chain");
+
+        PERMIT_2.permitTransferFrom(
+            permitTransferFrom,
+            transferDetails,
+            msg.sender,
+            signature
+        );
+
+        USDC.approve(
+            address(TOKEN_MESSENGER),
+            transferDetails.requestedAmount
+        );
+
+        uint256 fee = (transferDetails.requestedAmount * CCTP_FEE) / 1e6;
+
+        bytes memory message =  abi.encode(
+            pool, // pool type 
+            msg.sender, // user address
+            transferDetails.requestedAmount, // amount to deposit
+            vault // vault address if needed
+        );
+
+        TOKEN_MESSENGER.depositForBurnWithHook(
+            transferDetails.requestedAmount, // amount to deposit
+            chaindId, // destination chain ID
+            bytes32(uint256(uint160(yieldManager))), // recipient address on the destination chain
+            address(USDC), // USDC address on the source chain
+            bytes32(0), // morpho vault address on the destination chain
+            fee, // max fee for the CCTP transfer
+            MIN_FINALITY_THRESHOLD, // min finality threshold
+            message
+        );
+
+        emit DepositInitiated(
+            pool,
+            msg.sender,
+            transferDetails.requestedAmount
+        );
+        
     }
 
     // =============================================================
@@ -94,7 +167,6 @@ contract YieldManager is AccessControl {
 
         // 0.01% CCTP fee
         uint256 amountWithFee = (amount * (1e6 - CCTP_FEE)) / 1e6;
-        console.log('amountWithFee: %s', amountWithFee);
         uint256 shares = 0;
 
         bytes32 positionId = keccak256(
@@ -300,3 +372,4 @@ contract YieldManager is AccessControl {
         IERC20(token).transfer(to, amount);
     }
 }
+
