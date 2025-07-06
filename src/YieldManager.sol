@@ -222,20 +222,22 @@ contract YieldManager is AccessControl, ReentrancyGuard {
     //                          VIEWS
     // =============================================================
 
-    function getWithdrawableUSDCAave(
+    function getEarnedUSDCAave(
         address user
     ) public view returns (uint256) {
         Position memory position = positions[user];
         DataTypes.ReserveDataLegacy memory data = IAavePool(position.vault)
             .getReserveData(address(USDC));
-        return (position.shares * uint256(data.liquidityIndex)) / 1e27;
+        uint256 currentValue = (position.shares * uint256(data.liquidityIndex)) / 1e27;
+        return currentValue > position.amountUsdc ? currentValue - position.amountUsdc : 0;
     }
 
-    function getWithdrawableUSDCMorpho(
+    function getEarnedUSDCMorpho(
         address user
     ) public view returns (uint256) {
         Position memory position = positions[user];
-        return IMorphoVault(position.vault).convertToAssets(position.shares);
+        uint256 currentValue = IMorphoVault(position.vault).convertToAssets(position.shares);
+        return currentValue > position.amountUsdc ? currentValue - position.amountUsdc : 0;
     }
 
     // =============================================================
