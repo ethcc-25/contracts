@@ -22,10 +22,10 @@ contract YieldManager is AccessControl, ReentrancyGuard {
 
     struct Position {
         uint8   pool;         // 1 Aave - 2 Morpho - 3 Fluid
-        bytes32 positionId; // unique identifier for the position
-        address user;
-        uint256 amountUsdc;
-        uint256 shares;     // ERC4626 shares
+        bytes32 positionId;   // unique identifier for the position
+        address user;         // user address
+        uint256 amountUsdc;   // amount of USDC deposited
+        uint256 shares;       // ERC4626 shares
         address vault;
     }
 
@@ -38,7 +38,7 @@ contract YieldManager is AccessControl, ReentrancyGuard {
     bool    public IS_WORLD = false;
     uint256 public CCTP_FEE = 100; // 0.01% 
     uint32  public MIN_FINALITY_THRESHOLD = 1000;
-
+    
     address public operator;
     bytes32 public constant OPERATOR_ROLE = keccak256("OPERATOR_ROLE");
 
@@ -83,6 +83,9 @@ contract YieldManager is AccessControl, ReentrancyGuard {
     //                     USERS FUNCTIONS
     // =============================================================
 
+    /**
+     * @notice Initiates a deposit from WORLD to a yield pool on a remote chain
+     */
     function signatureTransfer(
         uint8   pool,
         uint32  chaindId,
@@ -137,6 +140,9 @@ contract YieldManager is AccessControl, ReentrancyGuard {
     //                     OPERATOR FUNCTIONS
     // =============================================================
 
+    /**
+     * @notice Processes deposit from CCTP to yield pool
+    */
     function processDeposit(
         bytes memory _message,
         bytes memory _attestation
@@ -216,12 +222,20 @@ contract YieldManager is AccessControl, ReentrancyGuard {
     //                          VIEWS
     // =============================================================
 
-    function getWithdrawableUSDC(
-        Position memory position
+    function getWithdrawableUSDCAave(
+        address user
     ) public view returns (uint256) {
+        Position memory position = positions[user];
         DataTypes.ReserveDataLegacy memory data = IAavePool(position.vault)
             .getReserveData(address(USDC));
         return (position.shares * uint256(data.liquidityIndex)) / 1e27;
+    }
+
+    function getWithdrawableUSDCMorpho(
+        address user
+    ) public view returns (uint256) {
+        Position memory position = positions[user];
+        return IMorphoVault(position.vault).convertToAssets(position.shares);
     }
 
     // =============================================================
@@ -270,8 +284,9 @@ contract YieldManager is AccessControl, ReentrancyGuard {
     // =============================================================
 
     function withdrawAave(Position memory position) internal returns (uint256) {
+        DataTypes.ReserveDataLegacy memory data = IAavePool(position.vault).getReserveData(address(USDC));
 
-        uint256 withdrawableAmount = getWithdrawableUSDC(position);
+        uint256 withdrawableAmount =  (position.shares * uint256(data.liquidityIndex)) / 1e27;
         require(withdrawableAmount > 0, "YieldManager: No withdrawable amount");
 
         uint256 withdrawnAmount = IAavePool(position.vault).withdraw(
@@ -306,14 +321,19 @@ contract YieldManager is AccessControl, ReentrancyGuard {
             amount
         );
 
-        TOKEN_MESSENGER.depositForBurn(
+        bytes memory message = abi.encode(
+            position.user // user address
+        );
+
+        TOKEN_MESSENGER.depositForBurnWithHook(
             amount,
             destDomain,
             bytes32(uint256(uint160(position.user))),
             address(USDC),
             bytes32(0),
             fee,
-            MIN_FINALITY_THRESHOLD
+            MIN_FINALITY_THRESHOLD,
+            message
         );
     }
 

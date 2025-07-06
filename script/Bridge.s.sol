@@ -24,10 +24,10 @@ contract BridgeUSDC is Script {
         vm.startBroadcast(pkey);
 
         bytes memory data = abi.encode(
-            uint8(2), // morpho pool
+            uint8(1), // morpho pool
             wallet, // user address
             amount, // amount to deposit
-            morphoVault
+            vault
         );
 
         usdc.approve(
@@ -38,7 +38,7 @@ contract BridgeUSDC is Script {
         messenger.depositForBurnWithHook(
             amount, // amount to deposit
             destinationChainId, //
-            bytes32(uint256(uint160(0x5615dEB798BB3E4dFa0139dFa1b3D433Cc23b72f))), // recipient address
+            bytes32(uint256(uint160(0x260857AA3776B50363091839998B8Dd688C585d7))), // recipient address
             0x79A02482A880bCE3F13e09Da970dC34db4CD24d1, // USDC address on WORLD
             bytes32(0), // destination caller => allowed address to get the tokens on the destination chain
             99999, // max fee
